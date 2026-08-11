@@ -738,6 +738,7 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
   const [brand, setBrand] = useState("LBKK");
   const [qtys, setQtys] = useState({});
   const [status, setStatus] = useState("");
+  const [openCategory, setOpenCategory] = useState(null);
 
   if (!outlet) return <EmptyState title="Session error" body="Outlet not found. Please log out and try again." />;
 
@@ -753,8 +754,18 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
   const weeks = monthMatrix(cursor.y, cursor.m);
 
   const items = config.items[brand] || [];
+  const categories = useMemo(() => {
+    const groups = {};
+    items.forEach((it) => {
+      const cat = it.category?.trim() || "General";
+      if (!groups[cat]) groups[cat] = [];
+      groups[cat].push(it);
+    });
+    return Object.entries(groups).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [items]);
   const todaysLogs = allEntries.filter((e) => e.date === selectedDate).sort((a, b) => (a.loggedAt < b.loggedAt ? 1 : -1));
   const totalPreview = items.reduce((s, it) => s + (Number(qtys[it.id]) || 0) * it.price, 0);
+  const categoryQtyCount = (catItems) => catItems.filter((it) => Number(qtys[it.id]) > 0).length;
 
   const submit = async () => {
     const rows = items.map((it) => ({
@@ -842,7 +853,10 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
         {BRANDS.map((b) => (
           <button
             key={b}
-            onClick={() => setBrand(b)}
+            onClick={() => {
+              setBrand(b);
+              setOpenCategory(null);
+            }}
             style={{
               ...styles.brandTab,
               borderColor: brand === b ? BRAND_COLOR[b] : "#D7DBE0",
@@ -857,28 +871,51 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
       {items.length === 0 ? (
         <EmptyState title={`No items set up for ${BRAND_LABEL[brand]}`} body="Ask an admin to add wastage items in Settings → Item Master." small />
       ) : (
-        <div style={styles.itemList}>
-          {items.map((it) => (
-            <div key={it.id} style={styles.itemRow}>
-              <div style={styles.itemName}>
-                {it.name}
-                <span style={styles.itemUnit}>{it.unit}</span>
+        <div style={styles.categoryList}>
+          {categories.map(([cat, catItems]) => {
+            const isOpen = openCategory === cat;
+            const filledCount = categoryQtyCount(catItems);
+            return (
+              <div key={cat} style={styles.categoryBlock}>
+                <button
+                  style={{ ...styles.categoryHead, borderColor: isOpen ? "#E2572B" : "#D7DBE0" }}
+                  onClick={() => setOpenCategory(isOpen ? null : cat)}
+                >
+                  <span style={styles.categoryHeadName}>{cat}</span>
+                  <span style={styles.categoryHeadMeta}>
+                    {filledCount > 0 && <span style={styles.categoryFilledTag}>{filledCount} entered</span>}
+                    <span style={styles.categoryCount}>{catItems.length} item{catItems.length === 1 ? "" : "s"}</span>
+                    <span style={{ ...styles.categoryChevron, transform: isOpen ? "rotate(90deg)" : "rotate(0deg)" }}>›</span>
+                  </span>
+                </button>
+                {isOpen && (
+                  <div style={styles.itemList}>
+                    {catItems.map((it) => (
+                      <div key={it.id} style={styles.itemRow}>
+                        <div style={styles.itemName}>
+                          {it.name}
+                          <span style={styles.itemUnit}>{it.unit}</span>
+                        </div>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={qtys[it.id] || ""}
+                          onChange={(e) => setQtys((q) => ({ ...q, [it.id]: e.target.value }))}
+                          style={styles.qtyInput}
+                        />
+                        <div style={styles.itemValue}>
+                          {config.currency}
+                          {fmtNum((Number(qtys[it.id]) || 0) * it.price)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                placeholder="0.00"
-                value={qtys[it.id] || ""}
-                onChange={(e) => setQtys((q) => ({ ...q, [it.id]: e.target.value }))}
-                style={styles.qtyInput}
-              />
-              <div style={styles.itemValue}>
-                {config.currency}
-                {fmtNum((Number(qtys[it.id]) || 0) * it.price)}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -936,7 +973,7 @@ function Settings({
   const [outletName, setOutletName] = useState("");
   const [outletPw, setOutletPw] = useState("");
   const [brand, setBrand] = useState("LBKK");
-  const [newItem, setNewItem] = useState({ name: "", unit: "kg", price: "" });
+  const [newItem, setNewItem] = useState({ name: "", unit: "kg", price: "", category: "" });
   const [currencyInput, setCurrencyInput] = useState(config.currency);
   const [masterPwInput, setMasterPwInput] = useState("");
 
@@ -1047,6 +1084,18 @@ function Settings({
 
         <div style={styles.itemAddRow}>
           <input
+            style={{ ...styles.textInput, flex: 1.4 }}
+            placeholder="Category (e.g. Fruits, Drinks)"
+            list="category-options"
+            value={newItem.category}
+            onChange={(e) => setNewItem((n) => ({ ...n, category: e.target.value }))}
+          />
+          <datalist id="category-options">
+            {[...new Set((config.items[brand] || []).map((i) => i.category?.trim()).filter(Boolean))].map((c) => (
+              <option key={c} value={c} />
+            ))}
+          </datalist>
+          <input
             style={{ ...styles.textInput, flex: 2 }}
             placeholder="Item name (e.g. Chicken Breast)"
             value={newItem.name}
@@ -1073,8 +1122,13 @@ function Settings({
             style={styles.addBtn}
             onClick={() => {
               if (newItem.name.trim() && newItem.price !== "") {
-                onAddItem(brand, { name: newItem.name.trim(), unit: newItem.unit, price: Number(newItem.price) });
-                setNewItem({ name: "", unit: "kg", price: "" });
+                onAddItem(brand, {
+                  name: newItem.name.trim(),
+                  unit: newItem.unit,
+                  price: Number(newItem.price),
+                  category: newItem.category.trim() || "General",
+                });
+                setNewItem({ name: "", unit: "kg", price: "", category: newItem.category });
               }
             }}
           >
@@ -1086,34 +1140,53 @@ function Settings({
           {(config.items[brand] || []).length === 0 && (
             <div style={styles.mutedNote}>No items for {BRAND_LABEL[brand]} yet.</div>
           )}
-          {(config.items[brand] || []).map((it) => (
-            <div key={it.id} style={styles.itemSettingsRow}>
-              <input
-                style={styles.itemEditName}
-                value={it.name}
-                onChange={(e) => onUpdateItem(brand, it.id, { name: e.target.value })}
-              />
-              <select
-                style={styles.itemEditUnit}
-                value={it.unit}
-                onChange={(e) => onUpdateItem(brand, it.id, { unit: e.target.value })}
-              >
-                <option value="kg">kg</option>
-                <option value="ltr">ltr</option>
-              </select>
-              <input
-                style={styles.itemEditPrice}
-                type="number"
-                min="0"
-                step="0.01"
-                value={it.price}
-                onChange={(e) => onUpdateItem(brand, it.id, { price: Number(e.target.value) })}
-              />
-              <button style={styles.removeBtn} onClick={() => onRemoveItem(brand, it.id)}>
-                Remove
-              </button>
-            </div>
-          ))}
+          {Object.entries(
+            (config.items[brand] || []).reduce((groups, it) => {
+              const cat = it.category?.trim() || "General";
+              (groups[cat] = groups[cat] || []).push(it);
+              return groups;
+            }, {})
+          )
+            .sort((a, b) => a[0].localeCompare(b[0]))
+            .map(([cat, catItems]) => (
+              <div key={cat}>
+                <div style={styles.itemCategoryLabel}>{cat}</div>
+                {catItems.map((it) => (
+                  <div key={it.id} style={styles.itemSettingsRow}>
+                    <input
+                      style={styles.itemEditCategory}
+                      value={it.category || ""}
+                      placeholder="category"
+                      onChange={(e) => onUpdateItem(brand, it.id, { category: e.target.value })}
+                    />
+                    <input
+                      style={styles.itemEditName}
+                      value={it.name}
+                      onChange={(e) => onUpdateItem(brand, it.id, { name: e.target.value })}
+                    />
+                    <select
+                      style={styles.itemEditUnit}
+                      value={it.unit}
+                      onChange={(e) => onUpdateItem(brand, it.id, { unit: e.target.value })}
+                    >
+                      <option value="kg">kg</option>
+                      <option value="ltr">ltr</option>
+                    </select>
+                    <input
+                      style={styles.itemEditPrice}
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={it.price}
+                      onChange={(e) => onUpdateItem(brand, it.id, { price: Number(e.target.value) })}
+                    />
+                    <button style={styles.removeBtn} onClick={() => onRemoveItem(brand, it.id)}>
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ))}
         </div>
         <div style={styles.mutedNote}>Removing an item only takes it off future entry screens — past logs keep the name, quantity and value they were recorded with.</div>
       </section>
@@ -1444,6 +1517,33 @@ const styles = {
     textTransform: "uppercase",
   },
   itemList: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 18 },
+  categoryList: { display: "flex", flexDirection: "column", gap: 10, marginBottom: 18 },
+  categoryBlock: { display: "flex", flexDirection: "column", gap: 8 },
+  categoryHead: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    background: "#FFFFFF",
+    border: "1px solid #D7DBE0",
+    borderRadius: 8,
+    padding: "12px 14px",
+    cursor: "pointer",
+    textAlign: "left",
+    width: "100%",
+  },
+  categoryHeadName: { fontFamily: "'Oswald', sans-serif", fontSize: 15, textTransform: "uppercase", letterSpacing: "0.02em" },
+  categoryHeadMeta: { display: "flex", alignItems: "center", gap: 10 },
+  categoryCount: { fontSize: 11.5, color: "#5B6472", fontFamily: "'JetBrains Mono', monospace" },
+  categoryFilledTag: {
+    fontSize: 11,
+    color: "#2FB8A6",
+    background: "rgba(47,184,166,0.12)",
+    border: "1px solid #2FB8A6",
+    borderRadius: 20,
+    padding: "2px 8px",
+    fontFamily: "'JetBrains Mono', monospace",
+  },
+  categoryChevron: { fontSize: 16, color: "#5B6472", transition: "transform 0.15s ease" },
   itemRow: {
     display: "grid",
     gridTemplateColumns: "1fr 110px 100px",
@@ -1589,12 +1689,30 @@ const styles = {
   itemAddRow: { display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" },
   itemSettingsRow: {
     display: "grid",
-    gridTemplateColumns: "2fr 90px 100px auto",
+    gridTemplateColumns: "1.2fr 2fr 90px 100px auto",
     gap: 8,
     alignItems: "center",
     background: "#F4F5F7",
     borderRadius: 6,
     padding: "8px 10px",
+    marginTop: 4,
+  },
+  itemCategoryLabel: {
+    fontFamily: "'Oswald', sans-serif",
+    fontSize: 12.5,
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+    color: "#5B6472",
+    marginTop: 12,
+    marginBottom: 2,
+  },
+  itemEditCategory: {
+    background: "#FFFFFF",
+    border: "1px solid #D7DBE0",
+    color: "#5B6472",
+    borderRadius: 5,
+    fontSize: 12,
+    padding: "5px 7px",
   },
   itemEditName: { background: "transparent", border: "none", color: "#1B1F24", fontSize: 13 },
   itemEditUnit: { background: "#FFFFFF", border: "1px solid #D7DBE0", color: "#1B1F24", borderRadius: 5, fontSize: 12, padding: "5px" },

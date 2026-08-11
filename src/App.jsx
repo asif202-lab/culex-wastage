@@ -309,7 +309,7 @@ export default function WastageTracker() {
               ← Dashboard
             </button>
           )}
-          {(mode === "dashboard" || mode === "settings-auth") && role !== "management" && (
+          {(mode === "dashboard" || mode === "settings-auth") && (
             <button style={styles.logoutBtn} onClick={() => setMode("management-menu")}>
               ← Menu
             </button>
@@ -406,9 +406,6 @@ export default function WastageTracker() {
           entriesByOutlet={entriesByOutlet}
         />
       )}
-      <footer style={styles.footer}>
-        Every wastage entry is kept permanently — nothing is ever auto-deleted, even if an outlet or item is later removed from the active list.
-      </footer>
     </div>
   );
 }

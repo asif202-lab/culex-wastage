@@ -142,9 +142,12 @@ export default function WastageTracker() {
   }, [mode, config.outlets, loadAllEntries]);
 
   // ---------- outlet / item mutations (nothing here ever deletes wastage history) ----------
-  const addOutlet = async (name, password) => {
+  const addOutlet = async (name, password, brand) => {
     if (!name.trim() || !password.trim()) return;
-    const next = { ...config, outlets: [...config.outlets, { id: uid(), name: name.trim(), password: password.trim() }] };
+    const next = {
+      ...config,
+      outlets: [...config.outlets, { id: uid(), name: name.trim(), password: password.trim(), brand: brand || "" }],
+    };
     await saveConfig(next);
   };
 
@@ -156,6 +159,11 @@ export default function WastageTracker() {
 
   const updateOutletPassword = async (id, password) => {
     const next = { ...config, outlets: config.outlets.map((o) => (o.id === id ? { ...o, password } : o)) };
+    await saveConfig(next);
+  };
+
+  const updateOutletBrand = async (id, brand) => {
+    const next = { ...config, outlets: config.outlets.map((o) => (o.id === id ? { ...o, brand } : o)) };
     await saveConfig(next);
   };
 
@@ -299,6 +307,11 @@ export default function WastageTracker() {
           {(mode === "entry" || mode === "settings") && (
             <div style={styles.sessionTag}>
               {mode === "entry" ? `Outlet: ${authedOutlet?.name || ""}` : "Admin session"}
+              {mode === "settings" && (
+                <button style={styles.logoutBtn} onClick={() => setMode("dashboard")}>
+                  Dashboard
+                </button>
+              )}
               <button style={styles.logoutBtn} onClick={goHome}>
                 Log out
               </button>
@@ -307,6 +320,11 @@ export default function WastageTracker() {
           {mode === "outlet-detail" && (
             <button style={styles.logoutBtn} onClick={() => setMode("dashboard")}>
               ← Dashboard
+            </button>
+          )}
+          {mode === "dashboard" && (
+            <button style={styles.logoutBtn} onClick={() => setMode("settings-auth")}>
+              Settings
             </button>
           )}
           {(mode === "dashboard" || mode === "settings-auth") && (
@@ -397,6 +415,7 @@ export default function WastageTracker() {
           onAddOutlet={addOutlet}
           onRemoveOutlet={removeOutlet}
           onUpdateOutletPassword={updateOutletPassword}
+          onUpdateOutletBrand={updateOutletBrand}
           onAddItem={addItem}
           onRemoveItem={removeItem}
           onUpdateItem={updateItem}
@@ -732,10 +751,11 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
   const now = new Date();
   const [cursor, setCursor] = useState({ y: now.getFullYear(), m: now.getMonth() });
   const [selectedDate, setSelectedDate] = useState(todayStr());
-  const [brand, setBrand] = useState("LBKK");
+  const [brand, setBrand] = useState(outlet?.brand || "LBKK");
   const [qtys, setQtys] = useState({});
   const [status, setStatus] = useState("");
   const [openCategory, setOpenCategory] = useState(null);
+  const brandLocked = Boolean(outlet?.brand);
 
   if (!outlet) return <EmptyState title="Session error" body="Outlet not found. Please log out and try again." />;
 
@@ -846,24 +866,31 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
         Logging for <b>{selectedDate}</b>{selectedDate === todayStr() ? " (today)" : ""}
       </div>
 
-      <div style={styles.brandTabs}>
-        {BRANDS.map((b) => (
-          <button
-            key={b}
-            onClick={() => {
-              setBrand(b);
-              setOpenCategory(null);
-            }}
-            style={{
-              ...styles.brandTab,
-              borderColor: brand === b ? BRAND_COLOR[b] : "#D7DBE0",
-              color: brand === b ? BRAND_COLOR[b] : "#5B6472",
-            }}
-          >
-            {BRAND_LABEL[b]}
-          </button>
-        ))}
-      </div>
+      {brandLocked ? (
+        <div style={styles.brandLockedTag}>
+          <span style={{ ...styles.brandDot, background: BRAND_COLOR[brand] }} />
+          {BRAND_LABEL[brand]}
+        </div>
+      ) : (
+        <div style={styles.brandTabs}>
+          {BRANDS.map((b) => (
+            <button
+              key={b}
+              onClick={() => {
+                setBrand(b);
+                setOpenCategory(null);
+              }}
+              style={{
+                ...styles.brandTab,
+                borderColor: brand === b ? BRAND_COLOR[b] : "#D7DBE0",
+                color: brand === b ? BRAND_COLOR[b] : "#5B6472",
+              }}
+            >
+              {BRAND_LABEL[b]}
+            </button>
+          ))}
+        </div>
+      )}
 
       {items.length === 0 ? (
         <EmptyState title={`No items set up for ${BRAND_LABEL[brand]}`} body="Ask an admin to add wastage items in Settings → Item Master." small />
@@ -959,6 +986,7 @@ function Settings({
   onAddOutlet,
   onRemoveOutlet,
   onUpdateOutletPassword,
+  onUpdateOutletBrand,
   onAddItem,
   onRemoveItem,
   onUpdateItem,
@@ -969,6 +997,7 @@ function Settings({
 }) {
   const [outletName, setOutletName] = useState("");
   const [outletPw, setOutletPw] = useState("");
+  const [newOutletBrand, setNewOutletBrand] = useState("LBKK");
   const [brand, setBrand] = useState("LBKK");
   const [newItem, setNewItem] = useState({ name: "", unit: "kg", price: "", category: "" });
   const [currencyInput, setCurrencyInput] = useState(config.currency);
@@ -985,6 +1014,13 @@ function Settings({
             value={outletName}
             onChange={(e) => setOutletName(e.target.value)}
           />
+          <select style={{ ...styles.select, minWidth: 90 }} value={newOutletBrand} onChange={(e) => setNewOutletBrand(e.target.value)}>
+            {BRANDS.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+          </select>
           <input
             style={{ ...styles.textInput, maxWidth: 130 }}
             placeholder="Password"
@@ -995,7 +1031,7 @@ function Settings({
             style={styles.addBtn}
             onClick={() => {
               if (outletName.trim() && outletPw.trim()) {
-                onAddOutlet(outletName, outletPw);
+                onAddOutlet(outletName, outletPw, newOutletBrand);
                 setOutletName("");
                 setOutletPw("");
               }
@@ -1007,10 +1043,10 @@ function Settings({
         <div style={styles.listBox}>
           {config.outlets.length === 0 && <div style={styles.mutedNote}>No outlets added yet.</div>}
           {config.outlets.map((o) => (
-            <OutletRow key={o.id} outlet={o} onRemove={onRemoveOutlet} onUpdatePassword={onUpdateOutletPassword} />
+            <OutletRow key={o.id} outlet={o} onRemove={onRemoveOutlet} onUpdatePassword={onUpdateOutletPassword} onUpdateBrand={onUpdateOutletBrand} />
           ))}
         </div>
-        <div style={styles.mutedNote}>Removing an outlet only takes it off this list — its wastage history is kept forever in storage.</div>
+        <div style={styles.mutedNote}>Removing an outlet only takes it off this list — its wastage history is kept forever in storage. An outlet's brand decides which item list they see — no more picking a brand tab each time.</div>
       </section>
 
       <section style={styles.panel}>
@@ -1191,12 +1227,24 @@ function Settings({
   );
 }
 
-function OutletRow({ outlet, onRemove, onUpdatePassword }) {
+function OutletRow({ outlet, onRemove, onUpdatePassword, onUpdateBrand }) {
   const [pw, setPw] = useState(outlet.password || "");
   const [reveal, setReveal] = useState(false);
   return (
     <div style={styles.outletRow}>
       <span style={styles.outletRowName}>{outlet.name}</span>
+      <select
+        style={styles.outletRowBrand}
+        value={outlet.brand || ""}
+        onChange={(e) => onUpdateBrand(outlet.id, e.target.value)}
+      >
+        <option value="">All brands</option>
+        {BRANDS.map((b) => (
+          <option key={b} value={b}>
+            {b}
+          </option>
+        ))}
+      </select>
       <input
         style={styles.outletRowPw}
         type={reveal ? "text" : "password"}
@@ -1502,6 +1550,17 @@ const styles = {
   },
   dayPanel: { marginTop: 16, background: "#FFFFFF", border: "1px solid #D7DBE0", borderRadius: 10, padding: 14 },
   brandTabs: { display: "flex", gap: 8, marginBottom: 16 },
+  brandLockedTag: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontFamily: "'Oswald', sans-serif",
+    fontSize: 14,
+    textTransform: "uppercase",
+    letterSpacing: "0.03em",
+    color: "#1B1F24",
+    marginBottom: 16,
+  },
   brandTab: {
     background: "#FFFFFF",
     border: "1px solid #D7DBE0",
@@ -1663,7 +1722,7 @@ const styles = {
   listBox: { display: "flex", flexDirection: "column", gap: 6, maxHeight: 260, overflowY: "auto", marginBottom: 10 },
   outletRow: {
     display: "grid",
-    gridTemplateColumns: "1fr 110px auto auto",
+    gridTemplateColumns: "1fr 100px 110px auto auto",
     gap: 8,
     alignItems: "center",
     background: "#F4F5F7",
@@ -1671,6 +1730,14 @@ const styles = {
     padding: "8px 10px",
   },
   outletRowName: { fontSize: 13 },
+  outletRowBrand: {
+    background: "#FFFFFF",
+    border: "1px solid #D7DBE0",
+    color: "#1B1F24",
+    borderRadius: 5,
+    padding: "6px 8px",
+    fontSize: 12,
+  },
   outletRowPw: {
     background: "#FFFFFF",
     border: "1px solid #D7DBE0",

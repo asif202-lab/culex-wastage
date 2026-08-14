@@ -15,6 +15,21 @@ const todayStr = () => new Date().toISOString().slice(0, 10);
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 const fmtNum = (n, d = 2) => (Number.isFinite(n) ? n.toFixed(d) : (0).toFixed(d));
 const pad2 = (n) => String(n).padStart(2, "0");
+const isWastage = (e) => !e.type || e.type === "wastage";
+const isProduction = (e) => e.type === "production";
+const isPurchase = (e) => e.type === "purchase";
+const isSale = (e) => e.type === "sale";
+
+// Sales are meant to be one running total per outlet per day (correctable by
+// re-entering), not itemized transactions — so when several sale entries
+// exist for the same date, only the most recently logged one counts.
+function dedupeSalesByDate(entries) {
+  const byDate = {};
+  entries.filter(isSale).forEach((e) => {
+    if (!byDate[e.date] || e.loggedAt > byDate[e.date].loggedAt) byDate[e.date] = e;
+  });
+  return Object.values(byDate);
+}
 
 function monthMatrix(year, month) {
   const first = new Date(year, month, 1);
@@ -49,6 +64,7 @@ export default function WastageTracker() {
   const [config, setConfig] = useState({
     outlets: [],
     items: { LBKK: [], SB: [], TRD: [] },
+    purchaseItems: { LBKK: [], SB: [], TRD: [] },
     currency: "₹",
     masterPassword: DEFAULT_MASTER_PASSWORD,
   });
@@ -66,6 +82,9 @@ export default function WastageTracker() {
   const [mode, setMode] = useState(role === "outlet" ? "entry-auth" : role === "management" ? "management-menu" : "landing");
   const [authedOutletId, setAuthedOutletId] = useState(null);
   const [range, setRange] = useState("30d");
+  const [dashboardTab, setDashboardTab] = useState("wastage");
+  const [customFrom, setCustomFrom] = useState(todayStr());
+  const [customTo, setCustomTo] = useState(todayStr());
   const [selectedOutletId, setSelectedOutletId] = useState(null);
   const [lastSync, setLastSync] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -79,6 +98,7 @@ export default function WastageTracker() {
         return {
           outlets: parsed.outlets || [],
           items: parsed.items || { LBKK: [], SB: [], TRD: [] },
+          purchaseItems: parsed.purchaseItems || { LBKK: [], SB: [], TRD: [] },
           currency: parsed.currency || "₹",
           masterPassword: parsed.masterPassword || DEFAULT_MASTER_PASSWORD,
         };
@@ -86,7 +106,13 @@ export default function WastageTracker() {
     } catch (e) {
       /* not found yet */
     }
-    return { outlets: [], items: { LBKK: [], SB: [], TRD: [] }, currency: "₹", masterPassword: DEFAULT_MASTER_PASSWORD };
+    return {
+      outlets: [],
+      items: { LBKK: [], SB: [], TRD: [] },
+      purchaseItems: { LBKK: [], SB: [], TRD: [] },
+      currency: "₹",
+      masterPassword: DEFAULT_MASTER_PASSWORD,
+    };
   }, []);
 
   const saveConfig = useCallback(async (next) => {
@@ -189,6 +215,30 @@ export default function WastageTracker() {
     await saveConfig(next);
   };
 
+  const addPurchaseItem = async (brand, item) => {
+    const next = {
+      ...config,
+      purchaseItems: { ...config.purchaseItems, [brand]: [...(config.purchaseItems[brand] || []), { id: uid(), ...item }] },
+    };
+    await saveConfig(next);
+  };
+
+  const removePurchaseItem = async (brand, id) => {
+    const next = {
+      ...config,
+      purchaseItems: { ...config.purchaseItems, [brand]: config.purchaseItems[brand].filter((i) => i.id !== id) },
+    };
+    await saveConfig(next);
+  };
+
+  const updatePurchaseItem = async (brand, id, patch) => {
+    const next = {
+      ...config,
+      purchaseItems: { ...config.purchaseItems, [brand]: config.purchaseItems[brand].map((i) => (i.id === id ? { ...i, ...patch } : i)) },
+    };
+    await saveConfig(next);
+  };
+
   const setCurrency = async (currency) => {
     await saveConfig({ ...config, currency });
   };
@@ -215,13 +265,14 @@ export default function WastageTracker() {
     URL.revokeObjectURL(url);
   };
 
-  const logWastage = async (outletId, date, rows) => {
+  const logEntries = async (outletId, date, rows) => {
     const current = entriesByOutlet[outletId] || (await loadEntries(outletId));
     const newEntries = rows
       .filter((r) => r.qty && Number(r.qty) > 0)
       .map((r) => ({
         id: uid(),
         date,
+        type: r.type || "wastage",
         brand: r.brand,
         itemId: r.itemId,
         itemName: r.itemName,
@@ -256,13 +307,20 @@ export default function WastageTracker() {
       d.setDate(d.getDate() - 29);
       return d.toISOString().slice(0, 10);
     }
+    if (range === "custom") return customFrom;
     return null;
-  }, [range]);
+  }, [range, customFrom]);
+
+  const rangeEnd = useMemo(() => {
+    if (range === "custom") return customTo;
+    return null;
+  }, [range, customTo]);
 
   const outletStats = useMemo(() => {
     return config.outlets.map((o) => {
-      const all = entriesByOutlet[o.id] || [];
-      const filtered = rangeStart ? all.filter((e) => e.date >= rangeStart) : all;
+      const all = (entriesByOutlet[o.id] || []).filter(isWastage);
+      let filtered = rangeStart ? all.filter((e) => e.date >= rangeStart) : all;
+      if (rangeEnd) filtered = filtered.filter((e) => e.date <= rangeEnd);
       const totalValue = filtered.reduce((s, e) => s + e.value, 0);
       const kg = filtered.filter((e) => e.unit === "kg").reduce((s, e) => s + e.qty, 0);
       const ltr = filtered.filter((e) => e.unit === "ltr").reduce((s, e) => s + e.qty, 0);
@@ -272,7 +330,7 @@ export default function WastageTracker() {
       }));
       return { outlet: o, count: filtered.length, totalValue, kg, ltr, byBrand };
     });
-  }, [config.outlets, entriesByOutlet, rangeStart]);
+  }, [config.outlets, entriesByOutlet, rangeStart, rangeEnd]);
 
   const grandTotal = outletStats.reduce((s, o) => s + o.totalValue, 0);
   const maxTotal = Math.max(1, ...outletStats.map((o) => o.totalValue));
@@ -364,6 +422,13 @@ export default function WastageTracker() {
           worstOutlet={worstOutlet}
           range={range}
           setRange={setRange}
+          customFrom={customFrom}
+          setCustomFrom={setCustomFrom}
+          customTo={customTo}
+          setCustomTo={setCustomTo}
+          entriesByOutlet={entriesByOutlet}
+          dashboardTab={dashboardTab}
+          setDashboardTab={setDashboardTab}
           onRefresh={() => loadAllEntries(config.outlets)}
           onOpenOutlet={(id) => {
             setSelectedOutletId(id);
@@ -393,7 +458,7 @@ export default function WastageTracker() {
           onBack={() => setMode("landing")}
         />
       ) : mode === "entry" ? (
-        <EntryForm config={config} outlet={authedOutlet} onLog={logWastage} entriesByOutlet={entriesByOutlet} />
+        <EntryForm config={config} outlet={authedOutlet} onLog={logEntries} entriesByOutlet={entriesByOutlet} />
       ) : mode === "settings-auth" ? (
         <PasswordGate
           title="Settings"
@@ -419,6 +484,9 @@ export default function WastageTracker() {
           onAddItem={addItem}
           onRemoveItem={removeItem}
           onUpdateItem={updateItem}
+          onAddPurchaseItem={addPurchaseItem}
+          onRemovePurchaseItem={removePurchaseItem}
+          onUpdatePurchaseItem={updatePurchaseItem}
           onSetCurrency={setCurrency}
           onSetMasterPassword={setMasterPassword}
           onExportBackup={exportBackup}
@@ -496,53 +564,95 @@ function PasswordGate({ title, subtitle, onSubmit, onBack, showBack }) {
 
 // ---------------- Management: Dashboard ----------------
 
-function Dashboard({ config, outletStats, grandTotal, maxTotal, worstOutlet, range, setRange, onRefresh, onOpenOutlet }) {
+function Dashboard({ config, outletStats, grandTotal, maxTotal, worstOutlet, range, setRange, customFrom, setCustomFrom, customTo, setCustomTo, entriesByOutlet, dashboardTab, setDashboardTab, onRefresh, onOpenOutlet }) {
   if (config.outlets.length === 0) {
     return <EmptyState title="No outlets yet" body="Outlets are added in Settings before wastage can be reported." />;
   }
   return (
     <div>
-      <div style={styles.toolbar}>
-        <div style={styles.rangeGroup}>
-          {[
-            ["today", "Today"],
-            ["7d", "7 Days"],
-            ["30d", "30 Days"],
-            ["all", "All Time"],
-          ].map(([k, label]) => (
-            <button
-              key={k}
-              onClick={() => setRange(k)}
-              style={{ ...styles.rangeBtn, ...(range === k ? styles.rangeBtnActive : {}) }}
-            >
-              {label}
+      <div style={styles.dashboardTabRow}>
+        <select style={styles.dashboardTabSelect} value={dashboardTab} onChange={(e) => setDashboardTab(e.target.value)}>
+          <option value="wastage">📉 Wastage report</option>
+          <option value="purchase">🧾 Purchase vs Sales report</option>
+        </select>
+      </div>
+
+      {dashboardTab === "purchase" ? (
+        <PurchaseReport config={config} entriesByOutlet={entriesByOutlet} />
+      ) : (
+        <>
+          <div style={styles.toolbar}>
+            <div style={styles.rangeGroup}>
+              {[
+                ["today", "Today"],
+                ["7d", "7 Days"],
+                ["30d", "30 Days"],
+                ["all", "All Time"],
+                ["custom", "Custom"],
+              ].map(([k, label]) => (
+                <button
+                  key={k}
+                  onClick={() => setRange(k)}
+                  style={{ ...styles.rangeBtn, ...(range === k ? styles.rangeBtnActive : {}) }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button style={styles.refreshBtn} onClick={onRefresh}>
+              ⟳ Refresh
             </button>
-          ))}
-        </div>
-        <button style={styles.refreshBtn} onClick={onRefresh}>
-          ⟳ Refresh
-        </button>
-      </div>
+          </div>
 
-      <div style={styles.summaryStrip}>
-        <SummaryCell label="Total wastage value" value={`${config.currency}${fmtNum(grandTotal)}`} accent="#E2572B" />
-        <SummaryCell label="Outlets reporting" value={`${outletStats.filter((o) => o.count > 0).length} / ${outletStats.length}`} />
-        <SummaryCell
-          label="Highest loss"
-          value={worstOutlet && worstOutlet.totalValue > 0 ? worstOutlet.outlet.name : "—"}
-          sub={worstOutlet && worstOutlet.totalValue > 0 ? `${config.currency}${fmtNum(worstOutlet.totalValue)}` : ""}
-          accent="#C9A227"
-        />
-      </div>
+          {range === "custom" && (
+            <div style={styles.customRangeBar}>
+              <label style={styles.customRangeField}>
+                From
+                <input type="date" value={customFrom} max={customTo} onChange={(e) => setCustomFrom(e.target.value)} style={styles.select} />
+              </label>
+              <label style={styles.customRangeField}>
+                To
+                <input type="date" value={customTo} min={customFrom} max={todayStr()} onChange={(e) => setCustomTo(e.target.value)} style={styles.select} />
+              </label>
+              <label style={styles.customRangeField}>
+                Or pick a whole month
+                <input
+                  type="month"
+                  value={customFrom.slice(0, 7)}
+                  onChange={(e) => {
+                    const [y, m] = e.target.value.split("-").map(Number);
+                    const first = `${e.target.value}-01`;
+                    const last = new Date(y, m, 0).toISOString().slice(0, 10);
+                    setCustomFrom(first);
+                    setCustomTo(last > todayStr() ? todayStr() : last);
+                  }}
+                  style={styles.select}
+                />
+              </label>
+            </div>
+          )}
 
-      <div style={styles.cardGrid}>
-        {outletStats
-          .slice()
-          .sort((a, b) => b.totalValue - a.totalValue)
-          .map((s) => (
-            <OutletCard key={s.outlet.id} stat={s} currency={config.currency} maxTotal={maxTotal} onOpen={() => onOpenOutlet(s.outlet.id)} />
-          ))}
-      </div>
+          <div style={styles.summaryStrip}>
+            <SummaryCell label="Total wastage value" value={`${config.currency}${fmtNum(grandTotal)}`} accent="#E2572B" />
+            <SummaryCell label="Outlets reporting" value={`${outletStats.filter((o) => o.count > 0).length} / ${outletStats.length}`} />
+            <SummaryCell
+              label="Highest loss"
+              value={worstOutlet && worstOutlet.totalValue > 0 ? worstOutlet.outlet.name : "—"}
+              sub={worstOutlet && worstOutlet.totalValue > 0 ? `${config.currency}${fmtNum(worstOutlet.totalValue)}` : ""}
+              accent="#C9A227"
+            />
+          </div>
+
+          <div style={styles.cardGrid}>
+            {outletStats
+              .slice()
+              .sort((a, b) => b.totalValue - a.totalValue)
+              .map((s) => (
+                <OutletCard key={s.outlet.id} stat={s} currency={config.currency} maxTotal={maxTotal} onOpen={() => onOpenOutlet(s.outlet.id)} />
+              ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -555,6 +665,152 @@ function SummaryCell({ label, value, sub, accent }) {
       {sub && <div style={styles.summarySub}>{sub}</div>}
     </div>
   );
+}
+
+function monthBounds(offsetFromCurrent) {
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + offsetFromCurrent);
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const first = `${y}-${pad2(m + 1)}-01`;
+  const lastDayNum = new Date(y, m + 1, 0).getDate();
+  const last = `${y}-${pad2(m + 1)}-${pad2(lastDayNum)}`;
+  return { from: first, to: last > todayStr() ? todayStr() : last };
+}
+
+function PurchaseReport({ config, entriesByOutlet }) {
+  const [periodA, setPeriodA] = useState(monthBounds(0));
+  const [periodB, setPeriodB] = useState(monthBounds(-1));
+
+  const allEntries = useMemo(() => Object.values(entriesByOutlet).flat(), [entriesByOutlet]);
+
+  const totalsFor = (from, to) => {
+    const inRange = (e) => e.date >= from && e.date <= to;
+    const purchase = allEntries.filter((e) => isPurchase(e) && inRange(e)).reduce((s, e) => s + e.value, 0);
+    const sales = dedupeSalesByDate(allEntries.filter(inRange)).reduce((s, e) => s + e.value, 0);
+    return { purchase, sales, diff: sales - purchase };
+  };
+
+  const totalsA = totalsFor(periodA.from, periodA.to);
+  const totalsB = totalsFor(periodB.from, periodB.to);
+  const pctChange = (a, b) => (b === 0 ? null : ((a - b) / b) * 100);
+
+  const outletBreakdown = useMemo(() => {
+    return config.outlets.map((o) => {
+      const entries = (entriesByOutlet[o.id] || []).filter((e) => e.date >= periodA.from && e.date <= periodA.to);
+      const purchase = entries.filter(isPurchase).reduce((s, e) => s + e.value, 0);
+      const sales = dedupeSalesByDate(entries).reduce((s, e) => s + e.value, 0);
+      return { outlet: o, purchase, sales, diff: sales - purchase };
+    });
+  }, [config.outlets, entriesByOutlet, periodA]);
+
+  const PeriodPicker = ({ label, period, setPeriod }) => (
+    <div style={styles.periodCard}>
+      <div style={styles.periodLabel}>{label}</div>
+      <div style={styles.customRangeBar}>
+        <label style={styles.customRangeField}>
+          From
+          <input type="date" value={period.from} max={period.to} onChange={(e) => setPeriod((p) => ({ ...p, from: e.target.value }))} style={styles.select} />
+        </label>
+        <label style={styles.customRangeField}>
+          To
+          <input type="date" value={period.to} min={period.from} max={todayStr()} onChange={(e) => setPeriod((p) => ({ ...p, to: e.target.value }))} style={styles.select} />
+        </label>
+        <label style={styles.customRangeField}>
+          Or pick a month
+          <input
+            type="month"
+            value={period.from.slice(0, 7)}
+            onChange={(e) => {
+              const [y, m] = e.target.value.split("-").map(Number);
+              const last = new Date(y, m, 0).toISOString().slice(0, 10);
+              setPeriod({ from: `${e.target.value}-01`, to: last > todayStr() ? todayStr() : last });
+            }}
+            style={styles.select}
+          />
+        </label>
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={styles.periodGrid} className="periodGrid">
+        <PeriodPicker label="Period A" period={periodA} setPeriod={setPeriodA} />
+        <PeriodPicker label="Period B (compare against)" period={periodB} setPeriod={setPeriodB} />
+      </div>
+
+      <div style={styles.comparisonGrid} className="comparisonGrid">
+        <ComparisonBlock label="Period A" period={periodA} totals={totalsA} currency={config.currency} />
+        <ComparisonBlock
+          label="Period B"
+          period={periodB}
+          totals={totalsB}
+          currency={config.currency}
+          changeVsA={{ purchase: pctChange(totalsA.purchase, totalsB.purchase), sales: pctChange(totalsA.sales, totalsB.sales) }}
+        />
+      </div>
+
+      <div style={{ ...styles.panelTitle, marginTop: 28 }}>Per outlet — Period A ({periodA.from} to {periodA.to})</div>
+      {outletBreakdown.every((o) => o.purchase === 0 && o.sales === 0) ? (
+        <EmptyState title="No purchase or sales logged yet" body="Once outlets log purchases and daily sales, this breakdown fills in." small />
+      ) : (
+        <div style={styles.itemTotalsTable}>
+          <div style={{ ...styles.itemTotalsHeadRowWide, gridTemplateColumns: "1.6fr 70px 1fr 1fr 1fr" }}>
+            <span>Outlet</span>
+            <span>Brand</span>
+            <span style={{ textAlign: "right" }}>Purchase</span>
+            <span style={{ textAlign: "right" }}>Sales</span>
+            <span style={{ textAlign: "right" }}>Difference</span>
+          </div>
+          {outletBreakdown
+            .slice()
+            .sort((a, b) => b.sales - a.sales)
+            .map((o) => (
+              <div key={o.outlet.id} style={{ ...styles.itemTotalsRowWide, gridTemplateColumns: "1.6fr 70px 1fr 1fr 1fr" }}>
+                <span>{o.outlet.name}</span>
+                <span style={{ color: BRAND_COLOR[o.outlet.brand] || "#5B6472" }}>{o.outlet.brand || "—"}</span>
+                <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#E2572B" }}>
+                  {config.currency}
+                  {fmtNum(o.purchase)}
+                </span>
+                <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#2FB8A6" }}>
+                  {config.currency}
+                  {fmtNum(o.sales)}
+                </span>
+                <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: o.diff >= 0 ? "#2FB8A6" : "#E2572B" }}>
+                  {o.diff >= 0 ? "+" : ""}
+                  {config.currency}
+                  {fmtNum(o.diff)}
+                </span>
+              </div>
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ComparisonBlock({ label, period, totals, currency, changeVsA }) {
+  return (
+    <div style={styles.comparisonBlock}>
+      <div style={styles.periodLabel}>
+        {label} <span style={{ color: "#8B92A0", fontWeight: 400 }}>({period.from} to {period.to})</span>
+      </div>
+      <div style={styles.summaryStrip}>
+        <SummaryCell label="Purchase amount" value={`${currency}${fmtNum(totals.purchase)}`} accent="#E2572B" sub={changeVsA ? pctLabel(changeVsA.purchase) : undefined} />
+        <SummaryCell label="Sales amount" value={`${currency}${fmtNum(totals.sales)}`} accent="#2FB8A6" sub={changeVsA ? pctLabel(changeVsA.sales) : undefined} />
+        <SummaryCell label="Difference" value={`${totals.diff >= 0 ? "+" : ""}${currency}${fmtNum(totals.diff)}`} accent={totals.diff >= 0 ? "#2FB8A6" : "#E2572B"} />
+      </div>
+    </div>
+  );
+}
+
+function pctLabel(pct) {
+  if (pct === null) return "vs A: n/a";
+  const sign = pct >= 0 ? "+" : "";
+  return `vs A: ${sign}${fmtNum(pct, 1)}%`;
 }
 
 function OutletCard({ stat, currency, maxTotal, onOpen }) {
@@ -607,7 +863,7 @@ function OutletDetail({ outlet, entries, currency }) {
 
   const dayTotals = useMemo(() => {
     const map = {};
-    entries.forEach((e) => {
+    entries.filter(isWastage).forEach((e) => {
       map[e.date] = (map[e.date] || 0) + e.value;
     });
     return map;
@@ -616,16 +872,24 @@ function OutletDetail({ outlet, entries, currency }) {
   const maxDay = Math.max(1, ...Object.values(dayTotals));
   const weeks = monthMatrix(cursor.y, cursor.m);
 
+  const monthPrefix = `${cursor.y}-${pad2(cursor.m + 1)}`;
+  const monthEntries = useMemo(() => entries.filter((e) => e.date.startsWith(monthPrefix)), [entries, monthPrefix]);
+
   const itemTotals = useMemo(() => {
     const map = {};
-    entries.forEach((e) => {
+    monthEntries.filter((e) => isWastage(e) || isProduction(e)).forEach((e) => {
       const key = `${e.brand}::${e.itemName}::${e.unit}`;
-      if (!map[key]) map[key] = { brand: e.brand, itemName: e.itemName, unit: e.unit, qty: 0, value: 0 };
-      map[key].qty += e.qty;
-      map[key].value += e.value;
+      if (!map[key])
+        map[key] = { brand: e.brand, itemName: e.itemName, unit: e.unit, producedQty: 0, wastedQty: 0, wastedValue: 0 };
+      if (isProduction(e)) map[key].producedQty += e.qty;
+      else map[key].wastedQty += e.qty, (map[key].wastedValue += e.value);
     });
-    return Object.values(map).sort((a, b) => b.value - a.value);
-  }, [entries]);
+    return Object.values(map).sort((a, b) => b.wastedValue - a.wastedValue);
+  }, [monthEntries]);
+
+  const monthProducedValue = monthEntries.filter(isProduction).reduce((s, e) => s + e.value, 0);
+  const monthWastedValue = monthEntries.filter(isWastage).reduce((s, e) => s + e.value, 0);
+  const overallWastePct = monthProducedValue > 0 ? (monthWastedValue / monthProducedValue) * 100 : null;
 
   const dayEntries = selectedDate ? entries.filter((e) => e.date === selectedDate) : [];
   const monthTotal = weeks.flat().reduce((s, c) => s + (c ? dayTotals[c.dateStr] || 0 : 0), 0);
@@ -637,11 +901,26 @@ function OutletDetail({ outlet, entries, currency }) {
           <div style={styles.eyebrow}>OUTLET REPORT</div>
           <h2 style={styles.h2}>{outlet.name}</h2>
         </div>
-        <div style={styles.summaryCell}>
-          <div style={styles.summaryLabel}>{MONTH_NAMES[cursor.m]} total</div>
-          <div style={{ ...styles.summaryValue, color: "#E2572B" }}>
-            {currency}
-            {fmtNum(monthTotal)}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div style={styles.summaryCell}>
+            <div style={styles.summaryLabel}>{MONTH_NAMES[cursor.m]} produced</div>
+            <div style={{ ...styles.summaryValue, color: "#2FB8A6" }}>
+              {currency}
+              {fmtNum(monthProducedValue)}
+            </div>
+          </div>
+          <div style={styles.summaryCell}>
+            <div style={styles.summaryLabel}>{MONTH_NAMES[cursor.m]} wasted</div>
+            <div style={{ ...styles.summaryValue, color: "#E2572B" }}>
+              {currency}
+              {fmtNum(monthTotal)}
+            </div>
+          </div>
+          <div style={styles.summaryCell}>
+            <div style={styles.summaryLabel}>Waste %</div>
+            <div style={{ ...styles.summaryValue, color: "#C9A227" }}>
+              {overallWastePct === null ? "—" : `${fmtNum(overallWastePct, 1)}%`}
+            </div>
           </div>
         </div>
       </div>
@@ -715,30 +994,43 @@ function OutletDetail({ outlet, entries, currency }) {
         </div>
       )}
 
-      <div style={{ ...styles.panelTitle, marginTop: 28 }}>Item-wise totals (all time)</div>
+      <div style={{ ...styles.panelTitle, marginTop: 28 }}>
+        Production & wastage sheet — {MONTH_NAMES[cursor.m]} {cursor.y}
+      </div>
       {itemTotals.length === 0 ? (
-        <EmptyState title="No wastage logged yet" body="Once this outlet logs entries, item totals appear here." small />
+        <EmptyState title="Nothing logged yet" body="Once this outlet logs production or wastage, the sheet appears here." small />
       ) : (
         <div style={styles.itemTotalsTable}>
-          <div style={styles.itemTotalsHeadRow}>
+          <div style={styles.itemTotalsHeadRowWide}>
             <span>Item</span>
             <span>Brand</span>
-            <span style={{ textAlign: "right" }}>Total wastage</span>
-            <span style={{ textAlign: "right" }}>Value</span>
+            <span style={{ textAlign: "right" }}>Produced</span>
+            <span style={{ textAlign: "right" }}>Wasted</span>
+            <span style={{ textAlign: "right" }}>Waste %</span>
+            <span style={{ textAlign: "right" }}>Value lost</span>
           </div>
-          {itemTotals.map((it, i) => (
-            <div key={i} style={styles.itemTotalsRow}>
-              <span>{it.itemName}</span>
-              <span style={{ color: BRAND_COLOR[it.brand] }}>{it.brand}</span>
-              <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace" }}>
-                {fmtNum(it.qty)} {it.unit}
-              </span>
-              <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#E2572B" }}>
-                {currency}
-                {fmtNum(it.value)}
-              </span>
-            </div>
-          ))}
+          {itemTotals.map((it, i) => {
+            const pct = it.producedQty > 0 ? (it.wastedQty / it.producedQty) * 100 : null;
+            return (
+              <div key={i} style={styles.itemTotalsRowWide}>
+                <span>{it.itemName}</span>
+                <span style={{ color: BRAND_COLOR[it.brand] }}>{it.brand}</span>
+                <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#2FB8A6" }}>
+                  {fmtNum(it.producedQty)} {it.unit}
+                </span>
+                <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace" }}>
+                  {fmtNum(it.wastedQty)} {it.unit}
+                </span>
+                <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: pct !== null && pct > 15 ? "#E2572B" : "#5B6472" }}>
+                  {pct === null ? "—" : `${fmtNum(pct, 1)}%`}
+                </span>
+                <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#E2572B" }}>
+                  {currency}
+                  {fmtNum(it.wastedValue)}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -753,16 +1045,30 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
   const [selectedDate, setSelectedDate] = useState(todayStr());
   const [brand, setBrand] = useState(outlet?.brand || "LBKK");
   const [qtys, setQtys] = useState({});
+  const [prodQtys, setProdQtys] = useState({});
   const [status, setStatus] = useState("");
   const [openCategory, setOpenCategory] = useState(null);
+  const [showSheet, setShowSheet] = useState(false);
+  const [entryType, setEntryType] = useState("wastage");
+  const [purchaseQtys, setPurchaseQtys] = useState({});
+  const [purchaseTotals, setPurchaseTotals] = useState({});
+  const [saleAmount, setSaleAmount] = useState("");
   const brandLocked = Boolean(outlet?.brand);
 
   if (!outlet) return <EmptyState title="Session error" body="Outlet not found. Please log out and try again." />;
+  if (!outlet.brand) {
+    return (
+      <EmptyState
+        title="No brand assigned yet"
+        body={`${outlet.name} isn't linked to a brand yet, so it can't log wastage. Ask an admin to assign LBKK, SB, or TRD in Settings → Outlets & passwords.`}
+      />
+    );
+  }
 
   const allEntries = entriesByOutlet[outlet.id] || [];
   const dayTotals = useMemo(() => {
     const map = {};
-    allEntries.forEach((e) => {
+    allEntries.filter(isWastage).forEach((e) => {
       map[e.date] = (map[e.date] || 0) + e.value;
     });
     return map;
@@ -782,24 +1088,101 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
   }, [items]);
   const todaysLogs = allEntries.filter((e) => e.date === selectedDate).sort((a, b) => (a.loggedAt < b.loggedAt ? 1 : -1));
   const totalPreview = items.reduce((s, it) => s + (Number(qtys[it.id]) || 0) * it.price, 0);
-  const categoryQtyCount = (catItems) => catItems.filter((it) => Number(qtys[it.id]) > 0).length;
+  const categoryQtyCount = (catItems) => catItems.filter((it) => Number(qtys[it.id]) > 0 || Number(prodQtys[it.id]) > 0).length;
+
+  const monthPrefix = `${cursor.y}-${pad2(cursor.m + 1)}`;
+  const monthEntries = useMemo(() => allEntries.filter((e) => e.date.startsWith(monthPrefix)), [allEntries, monthPrefix]);
+  const monthSheet = useMemo(() => {
+    const map = {};
+    monthEntries.filter((e) => isWastage(e) || isProduction(e)).forEach((e) => {
+      const key = `${e.itemName}::${e.unit}`;
+      if (!map[key]) map[key] = { itemName: e.itemName, unit: e.unit, producedQty: 0, wastedQty: 0, wastedValue: 0 };
+      if (isProduction(e)) map[key].producedQty += e.qty;
+      else map[key].wastedQty += e.qty, (map[key].wastedValue += e.value);
+    });
+    return Object.values(map).sort((a, b) => b.wastedValue - a.wastedValue);
+  }, [monthEntries]);
+
+  const monthPurchaseTotal = monthEntries.filter(isPurchase).reduce((s, e) => s + e.value, 0);
+  const monthSaleTotal = dedupeSalesByDate(monthEntries).reduce((s, e) => s + e.value, 0);
 
   const submit = async () => {
-    const rows = items.map((it) => ({
-      brand,
-      itemId: it.id,
-      itemName: it.name,
-      unit: it.unit,
-      qty: qtys[it.id],
-      price: it.price,
-    }));
+    const rows = [
+      ...items.map((it) => ({
+        type: "wastage",
+        brand,
+        itemId: it.id,
+        itemName: it.name,
+        unit: it.unit,
+        qty: qtys[it.id],
+        price: it.price,
+      })),
+      ...items.map((it) => ({
+        type: "production",
+        brand,
+        itemId: it.id,
+        itemName: it.name,
+        unit: it.unit,
+        qty: prodQtys[it.id],
+        price: it.price,
+      })),
+    ];
     const res = await onLog(outlet.id, selectedDate, rows);
     if (res.count > 0) {
       setQtys({});
-      setStatus(`Logged ${res.count} item${res.count === 1 ? "" : "s"} for ${selectedDate} · ${BRAND_LABEL[brand]}`);
+      setProdQtys({});
+      setStatus(`Logged ${res.count} entr${res.count === 1 ? "y" : "ies"} for ${selectedDate} · ${BRAND_LABEL[brand]}`);
       setTimeout(() => setStatus(""), 3500);
     } else {
-      setStatus("Enter a quantity greater than 0 for at least one item.");
+      setStatus("Enter a produced or wasted quantity for at least one item.");
+      setTimeout(() => setStatus(""), 3500);
+    }
+  };
+
+  const purchaseItems = config.purchaseItems?.[brand] || [];
+  const todaysSaleEntry = dedupeSalesByDate(allEntries.filter((e) => e.date === selectedDate))[0];
+
+  const submitPurchase = async () => {
+    const rows = purchaseItems
+      .filter((it) => Number(purchaseQtys[it.id]) > 0 && Number(purchaseTotals[it.id]) > 0)
+      .map((it) => {
+        const qty = Number(purchaseQtys[it.id]);
+        const total = Number(purchaseTotals[it.id]);
+        return {
+          type: "purchase",
+          brand,
+          itemId: it.id,
+          itemName: it.name,
+          unit: it.unit,
+          qty,
+          price: total / qty,
+        };
+      });
+    const res = await onLog(outlet.id, selectedDate, rows);
+    if (res.count > 0) {
+      setPurchaseQtys({});
+      setPurchaseTotals({});
+      setStatus(`Logged ${res.count} purchase${res.count === 1 ? "" : "s"} for ${selectedDate}`);
+      setTimeout(() => setStatus(""), 3500);
+    } else {
+      setStatus("Enter both a quantity and total price for at least one item.");
+      setTimeout(() => setStatus(""), 3500);
+    }
+  };
+
+  const submitSale = async () => {
+    const amount = Number(saleAmount);
+    if (!amount || amount <= 0) {
+      setStatus("Enter a sales amount greater than 0.");
+      setTimeout(() => setStatus(""), 3500);
+      return;
+    }
+    const res = await onLog(outlet.id, selectedDate, [
+      { type: "sale", brand, itemId: "sale", itemName: "Daily Sales", unit: "", qty: 1, price: amount },
+    ]);
+    if (res.count > 0) {
+      setSaleAmount("");
+      setStatus(`Logged sales of ${config.currency}${fmtNum(amount)} for ${selectedDate}`);
       setTimeout(() => setStatus(""), 3500);
     }
   };
@@ -866,6 +1249,22 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
         Logging for <b>{selectedDate}</b>{selectedDate === todayStr() ? " (today)" : ""}
       </div>
 
+      <div style={styles.entryTypeTabs}>
+        {[
+          ["wastage", "Wastage"],
+          ["purchase", "Purchase"],
+          ["sale", "Sale"],
+        ].map(([k, label]) => (
+          <button
+            key={k}
+            onClick={() => setEntryType(k)}
+            style={{ ...styles.entryTypeTab, ...(entryType === k ? styles.entryTypeTabActive : {}) }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
       {brandLocked ? (
         <div style={styles.brandLockedTag}>
           <span style={{ ...styles.brandDot, background: BRAND_COLOR[brand] }} />
@@ -892,7 +1291,33 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
         </div>
       )}
 
-      {items.length === 0 ? (
+      {entryType === "purchase" ? (
+        <PurchaseEntryPanel
+          purchaseItems={purchaseItems}
+          purchaseQtys={purchaseQtys}
+          setPurchaseQtys={setPurchaseQtys}
+          purchaseTotals={purchaseTotals}
+          setPurchaseTotals={setPurchaseTotals}
+          currency={config.currency}
+          brandLabel={BRAND_LABEL[brand]}
+          selectedDate={selectedDate}
+          monthLabel={MONTH_NAMES[cursor.m]}
+          monthPurchaseTotal={monthPurchaseTotal}
+          todaysPurchases={todaysLogs.filter(isPurchase)}
+          onSubmit={submitPurchase}
+        />
+      ) : entryType === "sale" ? (
+        <SaleEntryPanel
+          saleAmount={saleAmount}
+          setSaleAmount={setSaleAmount}
+          currency={config.currency}
+          selectedDate={selectedDate}
+          monthLabel={MONTH_NAMES[cursor.m]}
+          monthSaleTotal={monthSaleTotal}
+          todaysSaleEntry={todaysSaleEntry}
+          onSubmit={submitSale}
+        />
+      ) : items.length === 0 ? (
         <EmptyState title={`No items set up for ${BRAND_LABEL[brand]}`} body="Ask an admin to add wastage items in Settings → Item Master." small />
       ) : (
         <div style={styles.categoryList}>
@@ -914,12 +1339,27 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
                 </button>
                 {isOpen && (
                   <div style={styles.itemList}>
+                    <div style={styles.itemHeadRow}>
+                      <span></span>
+                      <span style={{ textAlign: "right", color: "#2FB8A6" }}>Produced</span>
+                      <span style={{ textAlign: "right" }}>Wasted</span>
+                      <span style={{ textAlign: "right" }}>Value lost</span>
+                    </div>
                     {catItems.map((it) => (
-                      <div key={it.id} style={styles.itemRow}>
+                      <div key={it.id} style={styles.itemRowDual}>
                         <div style={styles.itemName}>
                           {it.name}
                           <span style={styles.itemUnit}>{it.unit}</span>
                         </div>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          placeholder="0.00"
+                          value={prodQtys[it.id] || ""}
+                          onChange={(e) => setProdQtys((q) => ({ ...q, [it.id]: e.target.value }))}
+                          style={{ ...styles.qtyInput, borderColor: "#2FB8A6" }}
+                        />
                         <input
                           type="number"
                           min="0"
@@ -943,37 +1383,208 @@ function EntryForm({ config, outlet, onLog, entriesByOutlet }) {
         </div>
       )}
 
-      {items.length > 0 && (
+      {entryType === "wastage" && items.length > 0 && (
         <div style={styles.entryFooter}>
           <div style={styles.entryTotal}>
-            Preview total: <b>{config.currency}{fmtNum(totalPreview)}</b>
+            Wastage value entered: <b>{config.currency}{fmtNum(totalPreview)}</b>
           </div>
           <button style={styles.submitBtn} onClick={submit}>
-            Log wastage
+            Log entries
           </button>
         </div>
       )}
 
       {status && <div style={styles.statusBar}>{status}</div>}
 
-      {todaysLogs.length > 0 && (
+      {entryType === "wastage" && todaysLogs.filter((e) => isWastage(e) || isProduction(e)).length > 0 && (
         <div style={styles.todayLog}>
           <div style={styles.todayLogHead}>Already logged for {selectedDate}</div>
-          {todaysLogs.map((e) => (
+          {todaysLogs
+            .filter((e) => isWastage(e) || isProduction(e))
+            .map((e) => (
+              <div key={e.id} style={styles.todayLogRow}>
+                <span style={{ ...styles.brandDot, background: isProduction(e) ? "#2FB8A6" : BRAND_COLOR[e.brand] }} />
+                <span style={styles.todayLogItem}>
+                  {e.itemName} {isProduction(e) && <span style={styles.prodTag}>produced</span>}
+                </span>
+                <span style={styles.todayLogQty}>
+                  {fmtNum(e.qty)} {e.unit}
+                </span>
+                <span style={styles.todayLogVal}>
+                  {isProduction(e) ? "" : `${config.currency}${fmtNum(e.value)}`}
+                </span>
+              </div>
+            ))}
+        </div>
+      )}
+
+      {entryType === "wastage" && (
+        <div style={styles.sheetToggleWrap}>
+          <button style={styles.sheetToggleBtn} onClick={() => setShowSheet((s) => !s)}>
+            {showSheet ? "Hide" : "View"} {MONTH_NAMES[cursor.m]} production & wastage sheet {showSheet ? "▲" : "▼"}
+          </button>
+          {showSheet && (
+            monthSheet.length === 0 ? (
+              <EmptyState title="Nothing logged this month yet" body="Once you log production or wastage, this sheet fills in." small />
+            ) : (
+              <div style={styles.itemTotalsTable}>
+                <div style={styles.itemTotalsHeadRowWide}>
+                  <span>Item</span>
+                  <span style={{ textAlign: "right" }}>Produced</span>
+                  <span style={{ textAlign: "right" }}>Wasted</span>
+                  <span style={{ textAlign: "right" }}>Waste %</span>
+                  <span style={{ textAlign: "right" }}>Value lost</span>
+                </div>
+                {monthSheet.map((it, i) => {
+                  const pct = it.producedQty > 0 ? (it.wastedQty / it.producedQty) * 100 : null;
+                  return (
+                    <div key={i} style={{ ...styles.itemTotalsRowWide, gridTemplateColumns: "1.6fr 1fr 1fr 80px 1fr" }}>
+                      <span>{it.itemName}</span>
+                      <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#2FB8A6" }}>
+                        {fmtNum(it.producedQty)} {it.unit}
+                      </span>
+                      <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace" }}>
+                        {fmtNum(it.wastedQty)} {it.unit}
+                      </span>
+                      <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: pct !== null && pct > 15 ? "#E2572B" : "#5B6472" }}>
+                        {pct === null ? "—" : `${fmtNum(pct, 1)}%`}
+                      </span>
+                      <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: "#E2572B" }}>
+                        {config.currency}
+                        {fmtNum(it.wastedValue)}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PurchaseEntryPanel({
+  purchaseItems,
+  purchaseQtys,
+  setPurchaseQtys,
+  purchaseTotals,
+  setPurchaseTotals,
+  currency,
+  brandLabel,
+  selectedDate,
+  monthLabel,
+  monthPurchaseTotal,
+  todaysPurchases,
+  onSubmit,
+}) {
+  if (purchaseItems.length === 0) {
+    return (
+      <EmptyState
+        title={`No purchase items set up for ${brandLabel}`}
+        body="Ask an admin to add purchase items in Settings → Purchase Items."
+      />
+    );
+  }
+  return (
+    <div>
+      <div style={styles.summaryStrip}>
+        <SummaryCell label={`${monthLabel} purchases`} value={`${currency}${fmtNum(monthPurchaseTotal)}`} accent="#E2572B" />
+      </div>
+      <div style={styles.itemHeadRow}>
+        <span></span>
+        <span style={{ textAlign: "right" }}>Quantity</span>
+        <span style={{ textAlign: "right", gridColumn: "span 2" }}>Total price paid</span>
+      </div>
+      <div style={styles.itemList}>
+        {purchaseItems.map((it) => (
+          <div key={it.id} style={styles.itemRowDual}>
+            <div style={styles.itemName}>
+              {it.name}
+              <span style={styles.itemUnit}>{it.unit}</span>
+            </div>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="0.00"
+              value={purchaseQtys[it.id] || ""}
+              onChange={(e) => setPurchaseQtys((q) => ({ ...q, [it.id]: e.target.value }))}
+              style={styles.qtyInput}
+            />
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="0.00"
+              value={purchaseTotals[it.id] || ""}
+              onChange={(e) => setPurchaseTotals((q) => ({ ...q, [it.id]: e.target.value }))}
+              style={{ ...styles.qtyInput, gridColumn: "span 2", borderColor: "#E2572B" }}
+            />
+          </div>
+        ))}
+      </div>
+      <div style={styles.entryFooter}>
+        <div style={styles.entryTotal}>Enter quantity and the total you paid for it</div>
+        <button style={styles.submitBtn} onClick={onSubmit}>
+          Log purchase
+        </button>
+      </div>
+      {todaysPurchases.length > 0 && (
+        <div style={styles.todayLog}>
+          <div style={styles.todayLogHead}>Already logged for {selectedDate}</div>
+          {todaysPurchases.map((e) => (
             <div key={e.id} style={styles.todayLogRow}>
-              <span style={{ ...styles.brandDot, background: BRAND_COLOR[e.brand] }} />
+              <span style={{ ...styles.brandDot, background: "#E2572B" }} />
               <span style={styles.todayLogItem}>{e.itemName}</span>
               <span style={styles.todayLogQty}>
                 {fmtNum(e.qty)} {e.unit}
               </span>
               <span style={styles.todayLogVal}>
-                {config.currency}
+                {currency}
                 {fmtNum(e.value)}
               </span>
             </div>
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function SaleEntryPanel({ saleAmount, setSaleAmount, currency, selectedDate, monthLabel, monthSaleTotal, todaysSaleEntry, onSubmit }) {
+  return (
+    <div>
+      <div style={styles.summaryStrip}>
+        <SummaryCell label={`${monthLabel} sales`} value={`${currency}${fmtNum(monthSaleTotal)}`} accent="#2FB8A6" />
+      </div>
+      <div style={styles.salePanel}>
+        <label style={styles.saleLabel}>
+          Total sales for {selectedDate}
+          {todaysSaleEntry && (
+            <span style={styles.mutedNote}>
+              {" "}
+              — currently logged: {currency}
+              {fmtNum(todaysSaleEntry.value)}. Submitting again replaces it.
+            </span>
+          )}
+        </label>
+        <div style={styles.saleInputRow}>
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            placeholder={todaysSaleEntry ? String(todaysSaleEntry.value) : "0.00"}
+            value={saleAmount}
+            onChange={(e) => setSaleAmount(e.target.value)}
+            style={styles.saleInput}
+          />
+          <button style={styles.submitBtn} onClick={onSubmit}>
+            Log sale
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -990,6 +1601,9 @@ function Settings({
   onAddItem,
   onRemoveItem,
   onUpdateItem,
+  onAddPurchaseItem,
+  onRemovePurchaseItem,
+  onUpdatePurchaseItem,
   onSetCurrency,
   onSetMasterPassword,
   onExportBackup,
@@ -1000,6 +1614,8 @@ function Settings({
   const [newOutletBrand, setNewOutletBrand] = useState("LBKK");
   const [brand, setBrand] = useState("LBKK");
   const [newItem, setNewItem] = useState({ name: "", unit: "kg", price: "", category: "" });
+  const [purchaseBrand, setPurchaseBrand] = useState("LBKK");
+  const [newPurchaseItem, setNewPurchaseItem] = useState({ name: "", unit: "kg" });
   const [currencyInput, setCurrencyInput] = useState(config.currency);
   const [masterPwInput, setMasterPwInput] = useState("");
 
@@ -1046,7 +1662,7 @@ function Settings({
             <OutletRow key={o.id} outlet={o} onRemove={onRemoveOutlet} onUpdatePassword={onUpdateOutletPassword} onUpdateBrand={onUpdateOutletBrand} />
           ))}
         </div>
-        <div style={styles.mutedNote}>Removing an outlet only takes it off this list — its wastage history is kept forever in storage. An outlet's brand decides which item list they see — no more picking a brand tab each time.</div>
+        <div style={styles.mutedNote}>Removing an outlet only takes it off this list — its wastage history is kept forever in storage. Every outlet must be assigned exactly one brand — outlets can never see or log wastage for another brand's items.</div>
       </section>
 
       <section style={styles.panel}>
@@ -1223,6 +1839,82 @@ function Settings({
         </div>
         <div style={styles.mutedNote}>Removing an item only takes it off future entry screens — past logs keep the name, quantity and value they were recorded with.</div>
       </section>
+
+      <section style={{ ...styles.panel, gridColumn: "1 / -1" }}>
+        <div style={styles.panelTitle}>Purchase items</div>
+        <div style={styles.mutedNote}>Separate from wastage items — no fixed price, since purchase cost changes every time. Outlets enter the total they paid when logging.</div>
+        <div style={{ ...styles.brandTabs, marginTop: 12 }}>
+          {BRANDS.map((b) => (
+            <button
+              key={b}
+              onClick={() => setPurchaseBrand(b)}
+              style={{
+                ...styles.brandTab,
+                borderColor: purchaseBrand === b ? BRAND_COLOR[b] : "#D7DBE0",
+                color: purchaseBrand === b ? BRAND_COLOR[b] : "#5B6472",
+              }}
+            >
+              {BRAND_LABEL[b]}
+            </button>
+          ))}
+        </div>
+
+        <div style={styles.itemAddRow}>
+          <input
+            style={{ ...styles.textInput, flex: 2 }}
+            placeholder="Item name (e.g. Chicken, Flour, Packaging boxes)"
+            value={newPurchaseItem.name}
+            onChange={(e) => setNewPurchaseItem((n) => ({ ...n, name: e.target.value }))}
+          />
+          <select
+            style={{ ...styles.select, flex: 1 }}
+            value={newPurchaseItem.unit}
+            onChange={(e) => setNewPurchaseItem((n) => ({ ...n, unit: e.target.value }))}
+          >
+            <option value="kg">kg</option>
+            <option value="ltr">ltr</option>
+            <option value="pcs">pcs</option>
+          </select>
+          <button
+            style={styles.addBtn}
+            onClick={() => {
+              if (newPurchaseItem.name.trim()) {
+                onAddPurchaseItem(purchaseBrand, { name: newPurchaseItem.name.trim(), unit: newPurchaseItem.unit });
+                setNewPurchaseItem({ name: "", unit: newPurchaseItem.unit });
+              }
+            }}
+          >
+            + Add item
+          </button>
+        </div>
+
+        <div style={styles.listBox}>
+          {(config.purchaseItems?.[purchaseBrand] || []).length === 0 && (
+            <div style={styles.mutedNote}>No purchase items for {BRAND_LABEL[purchaseBrand]} yet.</div>
+          )}
+          {(config.purchaseItems?.[purchaseBrand] || []).map((it) => (
+            <div key={it.id} style={styles.purchaseItemRow}>
+              <input
+                style={styles.itemEditName}
+                value={it.name}
+                onChange={(e) => onUpdatePurchaseItem(purchaseBrand, it.id, { name: e.target.value })}
+              />
+              <select
+                style={styles.itemEditUnit}
+                value={it.unit}
+                onChange={(e) => onUpdatePurchaseItem(purchaseBrand, it.id, { unit: e.target.value })}
+              >
+                <option value="kg">kg</option>
+                <option value="ltr">ltr</option>
+                <option value="pcs">pcs</option>
+              </select>
+              <button style={styles.removeBtn} onClick={() => onRemovePurchaseItem(purchaseBrand, it.id)}>
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
@@ -1234,11 +1926,13 @@ function OutletRow({ outlet, onRemove, onUpdatePassword, onUpdateBrand }) {
     <div style={styles.outletRow}>
       <span style={styles.outletRowName}>{outlet.name}</span>
       <select
-        style={styles.outletRowBrand}
+        style={{ ...styles.outletRowBrand, ...(outlet.brand ? {} : { borderColor: "#E2572B", color: "#E2572B" }) }}
         value={outlet.brand || ""}
         onChange={(e) => onUpdateBrand(outlet.id, e.target.value)}
       >
-        <option value="">All brands</option>
+        <option value="" disabled>
+          ⚠ Not assigned
+        </option>
         {BRANDS.map((b) => (
           <option key={b} value={b}>
             {b}
@@ -1280,6 +1974,8 @@ const css = `
   @keyframes pulseAnim { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
   @media (max-width: 700px) {
     .settingsGrid { grid-template-columns: 1fr !important; }
+    .periodGrid { grid-template-columns: 1fr !important; }
+    .comparisonGrid { grid-template-columns: 1fr !important; }
   }
 `;
 
@@ -1445,6 +2141,35 @@ const styles = {
   },
   toolbar: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 18 },
   rangeGroup: { display: "flex", gap: 6 },
+  customRangeBar: {
+    display: "flex",
+    gap: 16,
+    flexWrap: "wrap",
+    background: "#FFFFFF",
+    border: "1px solid #D7DBE0",
+    borderRadius: 10,
+    padding: "12px 14px",
+    marginBottom: 18,
+  },
+  customRangeField: { display: "flex", flexDirection: "column", gap: 5, fontSize: 11.5, color: "#5B6472" },
+  dashboardTabRow: { marginBottom: 18 },
+  dashboardTabSelect: {
+    background: "#FFFFFF",
+    border: "1px solid #D7DBE0",
+    borderRadius: 8,
+    padding: "10px 14px",
+    fontSize: 14,
+    fontFamily: "'Oswald', sans-serif",
+    textTransform: "uppercase",
+    letterSpacing: "0.02em",
+    color: "#1B1F24",
+    minWidth: 260,
+  },
+  periodGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 18 },
+  periodCard: { background: "#F4F5F7", border: "1px solid #D7DBE0", borderRadius: 10, padding: 14 },
+  periodLabel: { fontFamily: "'Oswald', sans-serif", fontSize: 14, textTransform: "uppercase", letterSpacing: "0.02em", marginBottom: 10, color: "#1B1F24" },
+  comparisonGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 10 },
+  comparisonBlock: { background: "#FFFFFF", border: "1px solid #D7DBE0", borderRadius: 10, padding: 14 },
   rangeBtn: {
     background: "#FFFFFF",
     border: "1px solid #D7DBE0",
@@ -1533,11 +2258,11 @@ const styles = {
     alignItems: "center",
     justifyContent: "center",
     padding: 2,
-    minHeight: 44,
+    minHeight: 58,
   },
-  calCellBlank: { minHeight: 44 },
+  calCellBlank: { minHeight: 58 },
   calDayNum: { fontSize: 11, color: "#1B1F24", fontFamily: "'JetBrains Mono', monospace" },
-  calDayVal: { fontSize: 9.5, color: "#1B1F24", fontFamily: "'JetBrains Mono', monospace", marginTop: 2 },
+  calDayVal: { fontSize: 11, fontWeight: 700, color: "#1B1F24", fontFamily: "'JetBrains Mono', monospace", marginTop: 3 },
   entryDateBanner: {
     fontFamily: "'JetBrains Mono', monospace",
     fontSize: 13,
@@ -1549,6 +2274,34 @@ const styles = {
     borderRadius: 7,
   },
   dayPanel: { marginTop: 16, background: "#FFFFFF", border: "1px solid #D7DBE0", borderRadius: 10, padding: 14 },
+  entryTypeTabs: { display: "flex", gap: 6, marginBottom: 16, background: "#F4F5F7", padding: 4, borderRadius: 8, border: "1px solid #D7DBE0" },
+  entryTypeTab: {
+    flex: 1,
+    background: "transparent",
+    border: "none",
+    borderRadius: 6,
+    padding: "9px 0",
+    cursor: "pointer",
+    fontFamily: "'Oswald', sans-serif",
+    fontSize: 13,
+    textTransform: "uppercase",
+    letterSpacing: "0.03em",
+    color: "#5B6472",
+  },
+  entryTypeTabActive: { background: "#FFFFFF", color: "#1B1F24", boxShadow: "0 1px 2px rgba(0,0,0,0.08)" },
+  salePanel: { background: "#FFFFFF", border: "1px solid #D7DBE0", borderRadius: 10, padding: 18 },
+  saleLabel: { display: "block", fontSize: 13, color: "#5B6472", marginBottom: 10 },
+  saleInputRow: { display: "flex", gap: 10 },
+  saleInput: {
+    flex: 1,
+    background: "#F4F5F7",
+    border: "1px solid #D7DBE0",
+    color: "#1B1F24",
+    borderRadius: 7,
+    padding: "10px 12px",
+    fontFamily: "'JetBrains Mono', monospace",
+    fontSize: 16,
+  },
   brandTabs: { display: "flex", gap: 8, marginBottom: 16 },
   brandLockedTag: {
     display: "flex",
@@ -1610,6 +2363,35 @@ const styles = {
     borderRadius: 8,
     padding: "10px 12px",
   },
+  itemRowDual: {
+    display: "grid",
+    gridTemplateColumns: "1fr 90px 90px 90px",
+    gap: 10,
+    alignItems: "center",
+    background: "#FFFFFF",
+    border: "1px solid #D7DBE0",
+    borderRadius: 8,
+    padding: "10px 12px",
+  },
+  itemHeadRow: {
+    display: "grid",
+    gridTemplateColumns: "1fr 90px 90px 90px",
+    gap: 10,
+    fontSize: 10.5,
+    color: "#8B92A0",
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+    padding: "0 12px",
+  },
+  prodTag: {
+    fontSize: 10,
+    color: "#2FB8A6",
+    background: "rgba(47,184,166,0.12)",
+    border: "1px solid #2FB8A6",
+    borderRadius: 10,
+    padding: "1px 6px",
+    marginLeft: 6,
+  },
   itemName: { fontSize: 13.5, display: "flex", flexDirection: "column" },
   itemUnit: { fontSize: 11, color: "#5B6472", fontFamily: "'JetBrains Mono', monospace" },
   qtyInput: {
@@ -1664,6 +2446,22 @@ const styles = {
   todayLogItem: { color: "#1B1F24" },
   todayLogQty: { fontFamily: "'JetBrains Mono', monospace", color: "#5B6472", textAlign: "right" },
   todayLogVal: { fontFamily: "'JetBrains Mono', monospace", color: "#E2572B", textAlign: "right" },
+  sheetToggleWrap: { marginTop: 28 },
+  sheetToggleBtn: {
+    width: "100%",
+    textAlign: "left",
+    background: "#FFFFFF",
+    border: "1px solid #D7DBE0",
+    borderRadius: 8,
+    padding: "12px 14px",
+    cursor: "pointer",
+    fontFamily: "'Oswald', sans-serif",
+    fontSize: 13.5,
+    textTransform: "uppercase",
+    letterSpacing: "0.02em",
+    color: "#1B1F24",
+    marginBottom: 10,
+  },
   itemTotalsTable: { display: "flex", flexDirection: "column", gap: 4, marginTop: 10 },
   itemTotalsHeadRow: {
     display: "grid",
@@ -1678,6 +2476,27 @@ const styles = {
   itemTotalsRow: {
     display: "grid",
     gridTemplateColumns: "2fr 80px 1fr 1fr",
+    gap: 10,
+    alignItems: "center",
+    background: "#FFFFFF",
+    border: "1px solid #D7DBE0",
+    borderRadius: 7,
+    padding: "9px 10px",
+    fontSize: 13,
+  },
+  itemTotalsHeadRowWide: {
+    display: "grid",
+    gridTemplateColumns: "1.6fr 70px 1fr 1fr 80px 1fr",
+    gap: 10,
+    fontSize: 10.5,
+    color: "#8B92A0",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    padding: "0 10px 6px",
+  },
+  itemTotalsRowWide: {
+    display: "grid",
+    gridTemplateColumns: "1.6fr 70px 1fr 1fr 80px 1fr",
     gap: 10,
     alignItems: "center",
     background: "#FFFFFF",
@@ -1754,6 +2573,16 @@ const styles = {
   itemSettingsRow: {
     display: "grid",
     gridTemplateColumns: "1.2fr 2fr 90px 100px auto",
+    gap: 8,
+    alignItems: "center",
+    background: "#F4F5F7",
+    borderRadius: 6,
+    padding: "8px 10px",
+    marginTop: 4,
+  },
+  purchaseItemRow: {
+    display: "grid",
+    gridTemplateColumns: "2fr 90px auto",
     gap: 8,
     alignItems: "center",
     background: "#F4F5F7",

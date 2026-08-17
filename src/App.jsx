@@ -324,11 +324,17 @@ export default function WastageTracker() {
       const totalValue = filtered.reduce((s, e) => s + e.value, 0);
       const kg = filtered.filter((e) => e.unit === "kg").reduce((s, e) => s + e.qty, 0);
       const ltr = filtered.filter((e) => e.unit === "ltr").reduce((s, e) => s + e.qty, 0);
-      const byBrand = BRANDS.map((b) => ({
-        brand: b,
-        value: filtered.filter((e) => e.brand === b).reduce((s, e) => s + e.value, 0),
-      }));
-      return { outlet: o, count: filtered.length, totalValue, kg, ltr, byBrand };
+      const itemMap = {};
+      filtered.forEach((e) => {
+        const key = `${e.itemName}::${e.unit}`;
+        if (!itemMap[key]) itemMap[key] = { itemName: e.itemName, unit: e.unit, value: 0, qty: 0 };
+        itemMap[key].value += e.value;
+        itemMap[key].qty += e.qty;
+      });
+      const topItems = Object.values(itemMap)
+        .sort((a, b) => b.value - a.value)
+        .slice(0, 3);
+      return { outlet: o, count: filtered.length, totalValue, kg, ltr, topItems };
     });
   }, [config.outlets, entriesByOutlet, rangeStart, rangeEnd]);
 
@@ -814,7 +820,7 @@ function pctLabel(pct) {
 }
 
 function OutletCard({ stat, currency, maxTotal, onOpen }) {
-  const { outlet, totalValue, kg, ltr, count, byBrand } = stat;
+  const { outlet, totalValue, kg, ltr, count, topItems } = stat;
   const pct = Math.min(100, (totalValue / maxTotal) * 100);
   return (
     <button style={styles.docket} onClick={onOpen}>
@@ -823,6 +829,12 @@ function OutletCard({ stat, currency, maxTotal, onOpen }) {
         <div style={styles.docketName}>{outlet.name}</div>
         <div style={styles.docketCount}>{count} log{count === 1 ? "" : "s"}</div>
       </div>
+      {outlet.brand && (
+        <div style={styles.docketBrandTag}>
+          <span style={{ ...styles.brandDot, background: BRAND_COLOR[outlet.brand] }} />
+          {outlet.brand}
+        </div>
+      )}
       <div style={styles.docketValue}>
         {currency}
         {fmtNum(totalValue)}
@@ -836,16 +848,21 @@ function OutletCard({ stat, currency, maxTotal, onOpen }) {
         <span>{fmtNum(ltr)} ltr</span>
       </div>
       <div style={styles.brandRow}>
-        {byBrand.map((b) => (
-          <div key={b.brand} style={styles.brandChip}>
-            <span style={{ ...styles.brandDot, background: BRAND_COLOR[b.brand] }} />
-            <span style={styles.brandChipLabel}>{b.brand}</span>
-            <span style={styles.brandChipValue}>
-              {currency}
-              {fmtNum(b.value)}
-            </span>
-          </div>
-        ))}
+        <div style={styles.topItemsLabel}>Highest wastage items</div>
+        {topItems.length === 0 ? (
+          <div style={styles.mutedNote}>Nothing logged in this range.</div>
+        ) : (
+          topItems.map((it, i) => (
+            <div key={i} style={styles.brandChip}>
+              <span style={styles.topItemRank}>{i + 1}</span>
+              <span style={styles.brandChipLabel}>{it.itemName}</span>
+              <span style={styles.brandChipValue}>
+                {currency}
+                {fmtNum(it.value)}
+              </span>
+            </div>
+          ))
+        )}
       </div>
       <div style={styles.docketHint}>View calendar report →</div>
     </button>
@@ -2223,11 +2240,36 @@ const styles = {
   docketHead: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginTop: 4 },
   docketName: { fontFamily: "'Oswald', sans-serif", fontSize: 16, textTransform: "uppercase", letterSpacing: "0.02em" },
   docketCount: { fontSize: 11, color: "#5B6472" },
+  docketBrandTag: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 11,
+    fontFamily: "'JetBrains Mono', monospace",
+    textTransform: "uppercase",
+    letterSpacing: "0.04em",
+    color: "#5B6472",
+    marginTop: 6,
+  },
   docketValue: { fontFamily: "'JetBrains Mono', monospace", fontSize: 26, fontWeight: 700, marginTop: 10, color: "#E2572B" },
   gaugeTrack: { height: 4, background: "#F4F5F7", borderRadius: 2, marginTop: 10, overflow: "hidden" },
   gaugeFill: { height: "100%", background: "linear-gradient(90deg, #C9A227, #E2572B)" },
   docketMeta: { display: "flex", gap: 6, fontSize: 12, color: "#5B6472", marginTop: 8, fontFamily: "'JetBrains Mono', monospace" },
   brandRow: { display: "flex", flexDirection: "column", gap: 5, marginTop: 12, borderTop: "1px solid #D7DBE0", paddingTop: 10 },
+  topItemsLabel: { fontSize: 10.5, color: "#8B92A0", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 },
+  topItemRank: {
+    width: 16,
+    height: 16,
+    borderRadius: "50%",
+    background: "#F4F5F7",
+    color: "#5B6472",
+    fontSize: 10,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+    fontFamily: "'JetBrains Mono', monospace",
+  },
   brandChip: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 },
   brandDot: { width: 8, height: 8, borderRadius: "50%", display: "inline-block", flexShrink: 0 },
   brandChipLabel: { color: "#5B6472", flex: 1 },
